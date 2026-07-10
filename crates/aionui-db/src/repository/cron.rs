@@ -27,6 +27,7 @@ pub struct UpdateCronJobParams {
     pub last_error: Option<Option<String>>,
     pub run_count: Option<i64>,
     pub retry_count: Option<i64>,
+    pub queue_enabled: Option<bool>,
 }
 
 /// Data access abstraction for the `cron_jobs` table.

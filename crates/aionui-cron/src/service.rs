@@ -114,6 +114,7 @@ impl CronService {
             conversation_title,
             created_by: "agent".to_owned(),
             execution_mode: Some("existing".to_owned()),
+            queue_enabled: false,
             agent_config,
         };
 
@@ -197,6 +198,7 @@ impl CronService {
                     agent_config: None,
                     conversation_title: None,
                     max_retries: None,
+                    queue_enabled: None,
                 },
             )
             .await?;
@@ -290,6 +292,7 @@ impl CronService {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: req.queue_enabled,
         };
 
         self.validate_job_workspace(&job).await?;
@@ -369,6 +372,9 @@ impl CronService {
         }
         if let Some(max_retries) = req.max_retries {
             job.max_retries = max_retries;
+        }
+        if let Some(queue_enabled) = req.queue_enabled {
+            job.queue_enabled = queue_enabled;
         }
 
         if req.schedule.is_some() || req.enabled.is_some() {
@@ -1153,6 +1159,7 @@ impl CronService {
             run_count: 0,
             retry_count: 0,
             max_retries: 0,
+            queue_enabled: false,
         };
         self.scheduler.schedule_job(&retry_job);
     }
@@ -1835,6 +1842,7 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         last_error: None,
         run_count: None,
         retry_count: None,
+        queue_enabled: req.queue_enabled,
     }
 }
 
@@ -2076,6 +2084,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -2092,6 +2101,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.name.as_deref(), Some("New Name"));
@@ -2125,6 +2135,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
@@ -2166,6 +2177,7 @@ mod tests {
             }),
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
 
         let params = build_update_params(&job, &req);
@@ -2228,6 +2240,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.enabled, Some(false));
@@ -2247,6 +2260,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(

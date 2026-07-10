@@ -25,9 +25,9 @@ impl ICronRepository for SqliteCronRepository {
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
-                last_status, last_error, run_count, retry_count, max_retries\
+                last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -54,6 +54,7 @@ impl ICronRepository for SqliteCronRepository {
         .bind(row.run_count)
         .bind(row.retry_count)
         .bind(row.max_retries)
+        .bind(row.queue_enabled)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -101,6 +102,10 @@ impl ICronRepository for SqliteCronRepository {
 
         if let Some(v) = params.enabled {
             set_parts.push("enabled = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
+        if let Some(v) = params.queue_enabled {
+            set_parts.push("queue_enabled = ?".to_string());
             binds.push(BindValue::Bool(v));
         }
 
@@ -276,6 +281,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -367,6 +373,24 @@ mod tests {
         assert!(!updated.enabled);
         assert_eq!(updated.run_count, 42);
         assert!(updated.updated_at >= updated.created_at);
+    }
+
+    #[tokio::test]
+    async fn update_queue_enabled() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_queue")).await.unwrap();
+
+        repo.update(
+            "cron_queue",
+            &UpdateCronJobParams {
+                queue_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.get_by_id("cron_queue").await.unwrap().unwrap().queue_enabled);
     }
 
     #[tokio::test]
