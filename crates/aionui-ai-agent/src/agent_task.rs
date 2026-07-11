@@ -522,16 +522,18 @@ mod aionrs_config_option_tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             system_prompt: None,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             max_turns: None,
             max_tool_call_malformed_turns: None,
             max_tool_call_failure_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-agent-task-test-sessions"),
             session_mode: None,
+            skills: Vec::new(),
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
             runtime_env: Vec::new(),
+            prompt_dump_dir: None,
         }
     }
 
