@@ -4,19 +4,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{AppConfig, derive_encryption_key};
+use aionui_ai_agent::capability::codex_app_server::{CodexAppServerConfig, CodexAppServerGateway};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
+use aionui_conversation::{CodexNativeRuntime, ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, ICodexNativeRepository, IConversationRepository,
+    IMcpServerRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteCodexNativeRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
@@ -32,6 +33,7 @@ pub struct AppServices {
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub codex_native_runtime: Arc<CodexNativeRuntime>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -80,6 +82,7 @@ impl AppServices {
             worker_task_manager: self.worker_task_manager.clone(),
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
+            codex_native_runtime: self.codex_native_runtime.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
@@ -188,6 +191,16 @@ impl AppServices {
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let codex_gateway = CodexAppServerGateway::start(CodexAppServerConfig::default());
+        let codex_repo: Arc<dyn ICodexNativeRepository> =
+            Arc::new(SqliteCodexNativeRepository::new(database.pool().clone()));
+        let codex_native_runtime = CodexNativeRuntime::new(
+            codex_gateway,
+            codex_repo,
+            conversation_repo.clone(),
+            event_bus.clone(),
+            conversation_runtime_state.clone(),
+        );
         let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &database,
             work_dir: work_dir.clone(),
@@ -197,10 +210,12 @@ impl AppServices {
             worker_task_manager: worker_task_manager.clone(),
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
+            codex_native_runtime: codex_native_runtime.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
         });
+        codex_native_runtime.start();
 
         Ok(Self {
             database,
@@ -214,6 +229,7 @@ impl AppServices {
             active_lease_registry,
             conversation_runtime_state,
             conversation_service,
+            codex_native_runtime,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -241,6 +257,7 @@ struct ConversationServiceDeps<'a> {
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
+    codex_native_runtime: Arc<CodexNativeRuntime>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     runtime_helper_bin: String,
     runtime_base_url: String,
@@ -262,6 +279,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url);
+    service.with_codex_native(deps.codex_native_runtime);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),

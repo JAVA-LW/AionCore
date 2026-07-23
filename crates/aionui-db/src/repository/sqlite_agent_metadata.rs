@@ -644,8 +644,8 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 18 ACP vendors + 2 non-ACP builtins + 1 internal = 21.
-        assert_eq!(rows.len(), 21);
+        // 18 ACP vendors + 3 non-ACP builtins + 1 internal = 22.
+        assert_eq!(rows.len(), 22);
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")
@@ -656,6 +656,11 @@ mod tests {
         );
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));
+        assert!(
+            rows.iter().any(|r| {
+                r.name == "GPT Codex" && r.agent_type == "codex-app-server" && r.agent_source == "builtin"
+            })
+        );
         assert!(rows.iter().any(|r| r.name == "OpenClaw"
             && r.agent_type == "acp"
             && r.backend.as_deref() == Some("openclaw")

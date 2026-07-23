@@ -41,6 +41,51 @@ pub enum RuntimeLifecycleState {
 }
 
 impl ConversationRuntimeStateService {
+    /// Mirror a turn owned by an external shared runtime such as Codex
+    /// app-server. Unlike `try_claim_turn`, this does not reject an existing
+    /// turn because steer requests intentionally target that same turn.
+    pub fn set_external_turn(&self, conversation_id: &str, turn_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state
+                    .active_turns
+                    .insert(conversation_id.to_owned(), turn_id.to_owned());
+                info!(conversation_id, turn_id, "external conversation turn observed");
+            }
+            Err(_) => warn!(
+                conversation_id,
+                turn_id, "runtime state lock poisoned while observing external turn"
+            ),
+        }
+    }
+
+    pub fn clear_external_turn(&self, conversation_id: &str, turn_id: &str) {
+        let removed = match self.state.lock() {
+            Ok(mut state) => {
+                let matches = state
+                    .active_turns
+                    .get(conversation_id)
+                    .is_some_and(|active| active == turn_id);
+                if matches {
+                    state.active_turns.remove(conversation_id);
+                    state.cancelling_conversations.remove(conversation_id);
+                }
+                matches
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    turn_id, "runtime state lock poisoned while clearing external turn"
+                );
+                false
+            }
+        };
+        if removed {
+            self.release_notify.notify_waiters();
+            info!(conversation_id, turn_id, "external conversation turn completed");
+        }
+    }
+
     pub fn try_claim_turn(
         self: &Arc<Self>,
         conversation_id: &str,

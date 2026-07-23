@@ -165,7 +165,8 @@ impl<'a> SessionContextBuilder<'a> {
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
                 row, extra, team,
             )))),
-            AgentType::Gemini
+            AgentType::CodexAppServer
+            | AgentType::Gemini
             | AgentType::Codex
             | AgentType::OpenclawGateway
             | AgentType::Remote

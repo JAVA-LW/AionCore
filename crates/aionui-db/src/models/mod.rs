@@ -3,6 +3,7 @@ mod agent_metadata;
 mod assistant;
 mod channel;
 mod client_preference;
+mod codex_native;
 mod conversation;
 mod conversation_artifact;
 mod cron_job;
@@ -27,6 +28,7 @@ pub use assistant::{
 };
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
+pub use codex_native::{CodexThreadBindingRow, CodexWatchedWorkspaceRow};
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;

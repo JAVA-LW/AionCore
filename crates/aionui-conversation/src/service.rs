@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::codex_native::CodexNativeRuntime;
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
@@ -318,6 +319,7 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    codex_native: Arc<RwLock<Option<Arc<CodexNativeRuntime>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -390,6 +392,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            codex_native: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -452,6 +455,16 @@ impl ConversationService {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
         }
+    }
+
+    pub fn with_codex_native(&self, runtime: Arc<CodexNativeRuntime>) {
+        if let Ok(mut guard) = self.codex_native.write() {
+            *guard = Some(runtime);
+        }
+    }
+
+    fn codex_native(&self) -> Option<Arc<CodexNativeRuntime>> {
+        self.codex_native.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
     /// Register a hook to be notified when a conversation is deleted.
@@ -567,6 +580,33 @@ impl ConversationService {
     }
 
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
+        let is_codex_native = self
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| parse_agent_type_from_row(&row))
+            == Some(AgentType::CodexAppServer);
+        if is_codex_native {
+            let pending_confirmations = match self.codex_native() {
+                Some(runtime) => runtime.pending_confirmation_count(conversation_id).await,
+                None => 0,
+            };
+            let active = self.runtime_state.active_turn_id_for(conversation_id).is_some();
+            let mut summary = self.runtime_state.summary_from_parts(
+                conversation_id,
+                Some(if active {
+                    ConversationStatus::Running
+                } else {
+                    ConversationStatus::Finished
+                }),
+                true,
+                pending_confirmations,
+            );
+            summary.can_send_message = true;
+            return summary;
+        }
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
@@ -879,6 +919,7 @@ impl ConversationService {
                         );
                         obj.remove("preset_context");
                     }
+                    AgentType::CodexAppServer => {}
                     AgentType::Gemini
                     | AgentType::Codex
                     | AgentType::OpenclawGateway
@@ -1108,6 +1149,19 @@ impl ConversationService {
         };
 
         self.conversation_repo.create(&row).await?;
+
+        if effective_type == AgentType::CodexAppServer {
+            let workspace = extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ConversationError::BadRequest {
+                    reason: "GPT Codex conversation requires a workspace".into(),
+                })?;
+            let runtime = self.codex_native().ok_or_else(|| ConversationError::Busy {
+                reason: "Codex app-server runtime is unavailable".into(),
+            })?;
+            runtime.register_workspace(user_id, workspace, true).await?;
+        }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids).map_err(|e| {
@@ -2481,13 +2535,21 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConfirmationListResponse, ConversationError> {
-        self.conversation_repo
+        let row = self
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        if parse_agent_type_from_row(&row) == Some(AgentType::CodexAppServer) {
+            return match self.codex_native() {
+                Some(runtime) => runtime.list_confirmations(conversation_id).await,
+                None => Ok(Vec::new()),
+            };
+        }
 
         let agent = match task_manager.get_task(conversation_id) {
             Some(a) => a,
@@ -2509,13 +2571,30 @@ impl ConversationService {
         req: ConfirmRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
-        self.conversation_repo
+        let row = self
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        if parse_agent_type_from_row(&row) == Some(AgentType::CodexAppServer) {
+            let runtime = self.codex_native().ok_or_else(|| ConversationError::Busy {
+                reason: "Codex app-server runtime is unavailable".into(),
+            })?;
+            if let Some(conf_id) = runtime
+                .confirm(conversation_id, call_id, &req.data, req.always_allow)
+                .await?
+            {
+                self.broadcaster.broadcast(WebSocketMessage::new(
+                    "confirmation.remove",
+                    serde_json::json!({"conversation_id": conversation_id, "id": conf_id}),
+                ));
+            }
+            return Ok(());
+        }
 
         let agent = task_manager
             .get_task(conversation_id)
@@ -2617,6 +2696,26 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+
+        if parse_agent_type_from_row(&row) == Some(AgentType::CodexAppServer) {
+            let runtime = self.codex_native().ok_or_else(|| ConversationError::Busy {
+                reason: "Codex app-server runtime is unavailable".into(),
+            })?;
+            let msg_id = Self::mint_msg_id();
+            let outcome = runtime.send(&row, msg_id.clone(), req.content).await?;
+            self.runtime_state.set_external_turn(conversation_id, &outcome.turn_id);
+            info!(
+                conversation_id,
+                msg_id,
+                turn_id = %outcome.turn_id,
+                steered = outcome.steered,
+                pending_delivery = outcome.pending_delivery,
+                "Native Codex message accepted"
+            );
+            return Ok(self
+                .send_message_response(conversation_id, msg_id, outcome.turn_id)
+                .await);
+        }
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
@@ -2934,7 +3033,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
-        self.conversation_repo
+        let row = self
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -2950,6 +3050,20 @@ impl ConversationService {
                 active_turn_id = active_turn_id.as_deref(),
                 "cancel ignored because turn id mismatched"
             );
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
+
+        if parse_agent_type_from_row(&row) == Some(AgentType::CodexAppServer) {
+            let runtime = self.codex_native().ok_or_else(|| ConversationError::Busy {
+                reason: "Codex app-server runtime is unavailable".into(),
+            })?;
+            self.runtime_state.mark_cancelling(conversation_id);
+            if let Err(error) = runtime.interrupt(conversation_id, turn_id).await {
+                self.runtime_state.clear_cancelling(conversation_id);
+                return Err(error);
+            }
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });

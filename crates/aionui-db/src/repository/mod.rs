@@ -3,6 +3,7 @@ pub mod agent_metadata;
 pub mod assistant;
 pub mod channel;
 mod client_preference;
+pub mod codex_native;
 pub mod conversation;
 pub mod cron;
 pub mod diagnostics;
@@ -18,6 +19,7 @@ mod sqlite_agent_metadata;
 mod sqlite_assistant;
 mod sqlite_channel;
 mod sqlite_client_preference;
+mod sqlite_codex_native;
 mod sqlite_conversation;
 mod sqlite_cron;
 mod sqlite_diagnostics;
@@ -40,6 +42,7 @@ pub use assistant::{
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
+pub use codex_native::ICodexNativeRepository;
 pub use conversation::IConversationRepository;
 pub use cron::ICronRepository;
 pub use diagnostics::{
@@ -60,6 +63,7 @@ pub use sqlite_assistant::{
 };
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
+pub use sqlite_codex_native::SqliteCodexNativeRepository;
 pub use sqlite_conversation::SqliteConversationRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;

@@ -192,6 +192,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 belongs_to_team: false,
             })),
             AgentType::Gemini
+            | AgentType::CodexAppServer
             | AgentType::OpenclawGateway
             | AgentType::Remote
             | AgentType::Nanobot

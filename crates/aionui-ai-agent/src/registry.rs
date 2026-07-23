@@ -1245,7 +1245,8 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 21);
+        assert_eq!(all.len(), 22);
+        assert!(all.iter().any(|agent| agent.agent_type == AgentType::CodexAppServer));
     }
 
     #[tokio::test]
@@ -1427,7 +1428,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 21, "every row appears once");
+        assert_eq!(snapshot.len(), 22, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
