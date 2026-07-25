@@ -57,6 +57,13 @@ pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> boo
         .is_some()
 }
 
+// --- Image processing ---
+
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
+/// Remote image download size limit (5 MB).
+pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
+pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,10 +92,3 @@ mod tests {
         }))));
     }
 }
-
-// --- Image processing ---
-
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
-/// Remote image download size limit (5 MB).
-pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
-pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
