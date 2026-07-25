@@ -65,6 +65,20 @@ async fn thread_binding_upsert_is_idempotent_and_tracks_live_state() {
         Some(CodexThreadBindingRow {
             live_state: "live".into(),
             updated_at: 30,
+            ..saved.clone()
+        })
+    );
+
+    repo.update_binding_history_state("conversation-1", Some("next-page"), false, 29, 40)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.get_binding_for_conversation("conversation-1").await.unwrap(),
+        Some(CodexThreadBindingRow {
+            live_state: "live".into(),
+            history_cursor: Some("next-page".into()),
+            history_next_created_at: Some(29),
+            updated_at: 40,
             ..saved
         })
     );
@@ -91,6 +105,9 @@ fn binding(conversation_id: &str, live_state: &str, cwd: &str, timestamp: i64) -
         cwd: cwd.into(),
         source: "cli".into(),
         live_state: live_state.into(),
+        history_cursor: None,
+        history_complete: false,
+        history_next_created_at: None,
         created_at: timestamp,
         updated_at: timestamp,
     }

@@ -109,6 +109,7 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
+        .route("/api/codex/models", get(list_codex_models))
         .route("/api/conversation-projects", get(list_projects))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
@@ -128,6 +129,13 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
+}
+
+async fn list_codex_models(
+    State(state): State<ConversationRouterState>,
+) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, ApiError> {
+    let models = state.service.list_codex_native_models().await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(models)))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────

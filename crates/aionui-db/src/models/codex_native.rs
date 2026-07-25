@@ -21,6 +21,9 @@ pub struct CodexThreadBindingRow {
     pub cwd: String,
     pub source: String,
     pub live_state: String,
+    pub history_cursor: Option<String>,
+    pub history_complete: bool,
+    pub history_next_created_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

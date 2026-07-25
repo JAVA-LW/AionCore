@@ -22,4 +22,12 @@ pub trait ICodexNativeRepository: Send + Sync {
         live_state: &str,
         updated_at: aionui_common::TimestampMs,
     ) -> Result<(), DbError>;
+    async fn update_binding_history_state(
+        &self,
+        conversation_id: &str,
+        history_cursor: Option<&str>,
+        history_complete: bool,
+        history_next_created_at: aionui_common::TimestampMs,
+        updated_at: aionui_common::TimestampMs,
+    ) -> Result<(), DbError>;
 }

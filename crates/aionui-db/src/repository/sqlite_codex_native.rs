@@ -135,4 +135,27 @@ impl ICodexNativeRepository for SqliteCodexNativeRepository {
             .await?;
         Ok(())
     }
+
+    async fn update_binding_history_state(
+        &self,
+        conversation_id: &str,
+        history_cursor: Option<&str>,
+        history_complete: bool,
+        history_next_created_at: aionui_common::TimestampMs,
+        updated_at: aionui_common::TimestampMs,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE codex_thread_bindings
+             SET history_cursor = ?, history_complete = ?, history_next_created_at = ?, updated_at = ?
+             WHERE conversation_id = ?",
+        )
+        .bind(history_cursor)
+        .bind(history_complete)
+        .bind(history_next_created_at)
+        .bind(updated_at)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

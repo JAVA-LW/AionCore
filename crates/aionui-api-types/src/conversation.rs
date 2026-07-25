@@ -169,6 +169,10 @@ pub struct ListConversationsQuery {
     pub cron_job_id: Option<String>,
     pub pinned: Option<bool>,
     pub workspace: Option<String>,
+    /// Only return Codex root threads (plus non-Codex conversations).
+    pub codex_root_only: Option<bool>,
+    /// Return direct Codex sub-agents projected under this parent conversation.
+    pub codex_parent_conversation_id: Option<String>,
 }
 
 /// Query parameters for `GET /api/conversations/:id/messages`.

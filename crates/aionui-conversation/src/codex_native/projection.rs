@@ -3,12 +3,113 @@ use aionui_api_types::WebSocketMessage;
 use aionui_common::{ErrorChain, now_ms};
 use aionui_db::{CodexThreadBindingRow, ConversationRowUpdate};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{CodexNativeRuntime, pending_request_to_confirmation};
 use crate::ConversationError;
 
+const CODEX_TOOL_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
+const CODEX_TOOL_OUTPUT_OMISSION: &str = "\n...[middle omitted by AionUI]...\n";
+const TURNS_HISTORY_CURSOR_PREFIX: &str = "turns:";
+
 impl CodexNativeRuntime {
+    pub async fn sync_history_page(
+        &self,
+        conversation_id: &str,
+        expected_cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(), ConversationError> {
+        let sync_lock = {
+            let mut locks = self.history_sync_locks.lock().await;
+            locks
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = sync_lock.lock().await;
+        let binding = self
+            .codex_repo
+            .get_binding_for_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
+        if binding.history_complete || binding.history_cursor.as_deref() != expected_cursor {
+            return Ok(());
+        }
+
+        let stored_cursor = binding.history_cursor.as_deref();
+        let turns_cursor = stored_cursor.and_then(|cursor| cursor.strip_prefix(TURNS_HISTORY_CURSOR_PREFIX));
+        let (mut entries, next_cursor, turns_summary) = if stored_cursor.is_some() && turns_cursor.is_some() {
+            let page = self
+                .gateway
+                .list_thread_turns_summary(&binding.thread_id, turns_cursor, limit.clamp(1, 50).div_ceil(2))
+                .await
+                .map_err(super::codex_error)?;
+            (page.entries, page.next_cursor, true)
+        } else {
+            match self
+                .gateway
+                .list_thread_items(&binding.thread_id, stored_cursor, limit.clamp(1, 50))
+                .await
+            {
+                Ok(page) => (page.entries, page.next_cursor, false),
+                Err(error) if error.is_thread_items_unsupported() && stored_cursor.is_none() => {
+                    info!(
+                        conversation_id,
+                        thread_id = binding.thread_id,
+                        "Codex history uses legacy turn-summary pagination"
+                    );
+                    let page = self
+                        .gateway
+                        .list_thread_turns_summary(&binding.thread_id, None, limit.clamp(1, 50).div_ceil(2))
+                        .await
+                        .map_err(super::codex_error)?;
+                    (page.entries, page.next_cursor, true)
+                }
+                Err(error) => return Err(super::codex_error(error)),
+            }
+        };
+        let page_end = binding.history_next_created_at.unwrap_or_else(now_ms);
+        let page_start = page_end.saturating_sub(entries.len().saturating_sub(1) as i64);
+        entries.reverse();
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(item) = entry.get("item") else {
+                continue;
+            };
+            let turn_id = entry.get("turnId").and_then(Value::as_str).unwrap_or_default();
+            self.project_item(&binding, turn_id, item, page_start + index as i64, false, true)
+                .await?;
+        }
+        let next_created_at = page_start.saturating_sub(1);
+        let complete = next_cursor.is_none();
+        let persisted_cursor = next_cursor.map(|cursor| {
+            if turns_summary {
+                format!("{TURNS_HISTORY_CURSOR_PREFIX}{cursor}")
+            } else {
+                cursor
+            }
+        });
+        self.codex_repo
+            .update_binding_history_state(
+                conversation_id,
+                persisted_cursor.as_deref(),
+                complete,
+                next_created_at,
+                now_ms(),
+            )
+            .await?;
+        debug!(
+            conversation_id,
+            thread_id = binding.thread_id,
+            items = entries.len(),
+            complete,
+            turns_summary,
+            "Codex history page projected"
+        );
+        Ok(())
+    }
+
     pub(super) async fn handle_notification(&self, method: &str, params: &Value) -> Result<(), ConversationError> {
         if method == "thread/started" {
             let Some(thread) = params.get("thread") else {
@@ -16,8 +117,17 @@ impl CodexNativeRuntime {
             };
             let _guard = self.start_lock.lock().await;
             let codex_home = self.codex_home().await?;
+            if let Some(parent_thread_id) = super::thread_parent_id(thread)
+                && let Ok(parent_thread) = self.gateway.read_thread(parent_thread_id, false).await
+            {
+                let parent_bindings = self.ensure_bindings_for_thread(&codex_home, &parent_thread).await?;
+                for binding in parent_bindings {
+                    self.sync_binding_thread_state(&binding, &parent_thread).await?;
+                }
+            }
             let bindings = self.ensure_bindings_for_thread(&codex_home, thread).await?;
             for binding in bindings {
+                self.sync_binding_thread_state(&binding, thread).await?;
                 self.project_thread_history(&binding, thread).await?;
             }
             return Ok(());
@@ -38,6 +148,15 @@ impl CodexNativeRuntime {
         }
 
         match method {
+            "thread/status/changed" => {
+                let Some(status) = params.get("status") else {
+                    return Ok(());
+                };
+                let thread = json!({"status": status});
+                for binding in &bindings {
+                    self.sync_binding_thread_state(binding, &thread).await?;
+                }
+            }
             "turn/started" => {
                 let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) else {
                     return Ok(());
@@ -55,6 +174,7 @@ impl CodexNativeRuntime {
                         )
                         .await?;
                     self.broadcast_stream(&binding.conversation_id, turn_id, turn_id, "start", json!({}), None);
+                    self.broadcast_conversation_updated(&binding.conversation_id);
                 }
             }
             "turn/completed" => {
@@ -85,6 +205,7 @@ impl CodexNativeRuntime {
                             "canSendMessage": true,
                         }),
                     ));
+                    self.broadcast_conversation_updated(&binding.conversation_id);
                     self.deliver_pending(&binding.conversation_id, thread_id).await;
                 }
             }
@@ -161,6 +282,7 @@ impl CodexNativeRuntime {
                         let mut buffers = self.command_output_buffers.lock().await;
                         let buffer = buffers.entry(key).or_default();
                         buffer.push_str(delta);
+                        truncate_tool_output(buffer);
                         buffer.clone()
                     };
                     let data = json!({
@@ -334,6 +456,9 @@ impl CodexNativeRuntime {
                     .is_some();
                 self.persist_text(binding, item_id, text, "left", "finish", created_at)
                     .await?;
+                if !text.is_empty() {
+                    self.update_subagent_preview(binding, text).await?;
+                }
                 if broadcast && !had_stream && !text.is_empty() {
                     self.broadcast_stream(
                         &binding.conversation_id,
@@ -408,6 +533,11 @@ impl CodexNativeRuntime {
                 } else {
                     "running"
                 };
+                let (output, output_truncated, output_original_bytes) = item
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .map(tool_output_preview)
+                    .unwrap_or_else(|| (String::new(), false, 0));
                 let data = json!({
                     "call_id": item_id,
                     "name": "shell",
@@ -416,7 +546,9 @@ impl CodexNativeRuntime {
                         "cwd": item.get("cwd").cloned().unwrap_or(Value::Null),
                     },
                     "status": status,
-                    "output": item.get("aggregatedOutput").cloned().unwrap_or(Value::Null),
+                    "output": output,
+                    "output_truncated": output_truncated,
+                    "output_original_bytes": output_original_bytes,
                     "description": item.get("command").cloned().unwrap_or(Value::Null),
                 });
                 self.persist_structured(
@@ -517,6 +649,39 @@ impl CodexNativeRuntime {
         .await
     }
 
+    async fn update_subagent_preview(
+        &self,
+        binding: &CodexThreadBindingRow,
+        text: &str,
+    ) -> Result<(), ConversationError> {
+        let Some(conversation) = self.conversation_repo.get(&binding.conversation_id).await? else {
+            return Ok(());
+        };
+        let mut extra = serde_json::from_str::<Value>(&conversation.extra).unwrap_or_else(|_| json!({}));
+        if extra.get("codex_thread_role").and_then(Value::as_str) != Some("subagent") {
+            return Ok(());
+        }
+        let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = preview.chars().take(240).collect::<String>();
+        if preview.is_empty()
+            || extra.get("codex_last_message_preview").and_then(Value::as_str) == Some(preview.as_str())
+        {
+            return Ok(());
+        }
+        extra["codex_last_message_preview"] = Value::String(preview);
+        self.conversation_repo
+            .update(
+                &binding.conversation_id,
+                &ConversationRowUpdate {
+                    extra: Some(extra.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.broadcast_conversation_updated(&binding.conversation_id);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn persist_structured(
         &self,
@@ -580,6 +745,49 @@ impl CodexNativeRuntime {
     }
 }
 
+fn tool_output_preview(output: &str) -> (String, bool, usize) {
+    let original_bytes = output.len();
+    let mut preview = output.to_owned();
+    truncate_tool_output(&mut preview);
+    (
+        preview,
+        original_bytes > CODEX_TOOL_OUTPUT_PREVIEW_BYTES,
+        original_bytes,
+    )
+}
+
+fn truncate_tool_output(output: &mut String) {
+    if output.len() <= CODEX_TOOL_OUTPUT_PREVIEW_BYTES {
+        return;
+    }
+
+    let half = CODEX_TOOL_OUTPUT_PREVIEW_BYTES / 2;
+    let head_end = floor_char_boundary(output, half);
+    let tail_start = ceil_char_boundary(output, output.len().saturating_sub(half));
+    let mut preview =
+        String::with_capacity(head_end + CODEX_TOOL_OUTPUT_OMISSION.len() + output.len().saturating_sub(tail_start));
+    preview.push_str(&output[..head_end]);
+    preview.push_str(CODEX_TOOL_OUTPUT_OMISSION);
+    preview.push_str(&output[tail_start..]);
+    *output = preview;
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 fn user_message_text(item: &Value) -> String {
     item.get("content")
         .and_then(Value::as_array)
@@ -598,4 +806,31 @@ fn user_message_text(item: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CODEX_TOOL_OUTPUT_OMISSION, CODEX_TOOL_OUTPUT_PREVIEW_BYTES, tool_output_preview};
+
+    #[test]
+    fn tool_output_preview_keeps_small_output_unchanged() {
+        let (preview, truncated, original_bytes) = tool_output_preview("hello");
+
+        assert_eq!(preview, "hello");
+        assert!(!truncated);
+        assert_eq!(original_bytes, 5);
+    }
+
+    #[test]
+    fn tool_output_preview_bounds_large_utf8_output_and_keeps_both_ends() {
+        let output = format!("HEAD{}TAIL", "界".repeat(CODEX_TOOL_OUTPUT_PREVIEW_BYTES));
+        let (preview, truncated, original_bytes) = tool_output_preview(&output);
+
+        assert!(truncated);
+        assert_eq!(original_bytes, output.len());
+        assert!(preview.starts_with("HEAD"));
+        assert!(preview.contains(CODEX_TOOL_OUTPUT_OMISSION));
+        assert!(preview.ends_with("TAIL"));
+        assert!(preview.len() <= CODEX_TOOL_OUTPUT_PREVIEW_BYTES + CODEX_TOOL_OUTPUT_OMISSION.len());
+    }
 }

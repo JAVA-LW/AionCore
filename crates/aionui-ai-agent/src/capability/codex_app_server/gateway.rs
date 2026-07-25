@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use rusqlite::OpenFlags;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
@@ -19,13 +21,13 @@ use tokio::process::Child;
 #[cfg(unix)]
 use tokio_tungstenite::WebSocketStream;
 #[cfg(unix)]
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 #[cfg(unix)]
 use tracing::{info, warn};
 
 use super::protocol::{
     CodexAppServerError, CodexAppServerEvent, CodexAppServerSnapshot, CodexPendingRequest, CodexSendReceipt,
-    CodexThreadRuntime, ICodexAppServerGateway,
+    CodexThreadItemsPage, CodexThreadPage, CodexThreadRuntime, CodexThreadTurnsPage, ICodexAppServerGateway,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,6 +66,7 @@ pub struct CodexAppServerGateway {
     command_tx: mpsc::Sender<GatewayCommand>,
     event_tx: broadcast::Sender<CodexAppServerEvent>,
     snapshot: Arc<RwLock<CodexAppServerSnapshot>>,
+    codex_home: PathBuf,
 }
 
 impl CodexAppServerGateway {
@@ -71,10 +74,12 @@ impl CodexAppServerGateway {
         let (command_tx, command_rx) = mpsc::channel(256);
         let (event_tx, _) = broadcast::channel(1024);
         let snapshot = Arc::new(RwLock::new(CodexAppServerSnapshot::default()));
+        let codex_home = config.codex_home.clone();
         let gateway = Arc::new(Self {
             command_tx,
             event_tx: event_tx.clone(),
             snapshot: snapshot.clone(),
+            codex_home,
         });
 
         #[cfg(unix)]
@@ -155,34 +160,109 @@ impl ICodexAppServerGateway for CodexAppServerGateway {
         self.snapshot.read().await.clone()
     }
 
-    async fn list_threads(&self, archived: bool) -> Result<Vec<Value>, CodexAppServerError> {
+    async fn list_models(&self) -> Result<Vec<Value>, CodexAppServerError> {
         let mut cursor: Option<String> = None;
-        let mut threads = Vec::new();
+        let mut models = Vec::new();
         loop {
             let response = self
                 .rpc(
-                    "thread/list",
+                    "model/list",
                     json!({
                         "cursor": cursor,
                         "limit": 100,
-                        "sortKey": "updated_at",
-                        "sortDirection": "desc",
-                        "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
-                        "archived": archived,
+                        "includeHidden": false,
                     }),
                 )
                 .await?;
             let data = response
                 .get("data")
                 .and_then(Value::as_array)
-                .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/list omitted data".into()))?;
-            threads.extend(data.iter().cloned());
+                .ok_or_else(|| CodexAppServerError::InvalidResponse("model/list omitted data".into()))?;
+            models.extend(data.iter().cloned());
             cursor = response.get("nextCursor").and_then(Value::as_str).map(str::to_owned);
             if cursor.is_none() {
                 break;
             }
         }
-        Ok(threads)
+        Ok(models)
+    }
+
+    async fn list_thread_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+        archived: bool,
+    ) -> Result<CodexThreadPage, CodexAppServerError> {
+        let response = self
+            .rpc(
+                "thread/list",
+                json!({
+                    "cursor": cursor,
+                    "limit": limit.clamp(1, 100),
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                    "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
+                    "archived": archived,
+                    "useStateDbOnly": true,
+                }),
+            )
+            .await?;
+        let threads = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/list omitted data".into()))?;
+        Ok(CodexThreadPage {
+            threads,
+            next_cursor: response.get("nextCursor").and_then(Value::as_str).map(str::to_owned),
+        })
+    }
+
+    async fn list_thread_descendants(
+        &self,
+        ancestor_thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        archived: bool,
+    ) -> Result<CodexThreadPage, CodexAppServerError> {
+        let response = self
+            .rpc(
+                "thread/list",
+                json!({
+                    "cursor": cursor,
+                    "limit": limit.clamp(1, 100),
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                    "sourceKinds": ["subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther"],
+                    "archived": archived,
+                    "ancestorThreadId": ancestor_thread_id,
+                    "useStateDbOnly": true,
+                }),
+            )
+            .await?;
+        let mut threads = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/list descendants omitted data".into()))?;
+        if threads.is_empty() && cursor.is_none() {
+            #[cfg(unix)]
+            {
+                threads = self.fallback_descendant_threads(ancestor_thread_id, archived).await?;
+                if !threads.is_empty() {
+                    info!(
+                        ancestor_thread_id,
+                        archived,
+                        descendants = threads.len(),
+                        "Codex descendant catalog recovered from state index"
+                    );
+                }
+            }
+        }
+        Ok(CodexThreadPage {
+            threads,
+            next_cursor: response.get("nextCursor").and_then(Value::as_str).map(str::to_owned),
+        })
     }
 
     async fn list_loaded_threads(&self) -> Result<Vec<String>, CodexAppServerError> {
@@ -213,17 +293,114 @@ impl ICodexAppServerGateway for CodexAppServerGateway {
     }
 
     async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexAppServerError> {
-        let response = self.rpc("thread/resume", json!({"threadId": thread_id})).await?;
-        let thread = response
+        let response = self
+            .rpc("thread/resume", json!({"threadId": thread_id, "excludeTurns": true}))
+            .await?;
+        let mut thread = response
             .get("thread")
             .cloned()
             .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/resume omitted thread".into()))?;
+        let turns = self
+            .rpc(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "summary",
+                }),
+            )
+            .await?
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/turns/list omitted data".into()))?;
+        if let Some(object) = thread.as_object_mut() {
+            object.insert("turns".into(), Value::Array(turns));
+        }
         self.record_thread_snapshot(&thread).await;
         Ok(thread)
     }
 
-    async fn start_thread(&self, cwd: &str) -> Result<Value, CodexAppServerError> {
-        let response = self.rpc("thread/start", json!({"cwd": cwd})).await?;
+    async fn list_thread_items(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<CodexThreadItemsPage, CodexAppServerError> {
+        let response = self
+            .rpc(
+                "thread/items/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": limit,
+                    "sortDirection": "desc",
+                }),
+            )
+            .await?;
+        let entries = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/items/list omitted data".into()))?;
+        Ok(CodexThreadItemsPage {
+            entries,
+            next_cursor: response.get("nextCursor").and_then(Value::as_str).map(str::to_owned),
+        })
+    }
+
+    async fn list_thread_turns_summary(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<CodexThreadTurnsPage, CodexAppServerError> {
+        let response = self
+            .rpc(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": limit.clamp(1, 50),
+                    "sortDirection": "desc",
+                    "itemsView": "summary",
+                }),
+            )
+            .await?;
+        let turns = response
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CodexAppServerError::InvalidResponse("thread/turns/list omitted data".into()))?;
+        let mut entries = Vec::new();
+        for turn in turns {
+            let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items.iter().rev() {
+                    entries.push(json!({"turnId": turn_id, "item": item}));
+                }
+            }
+        }
+        Ok(CodexThreadTurnsPage {
+            entries,
+            next_cursor: response.get("nextCursor").and_then(Value::as_str).map(str::to_owned),
+        })
+    }
+
+    async fn start_thread(
+        &self,
+        cwd: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Value, CodexAppServerError> {
+        let mut params = json!({"cwd": cwd});
+        if let Some(model) = model {
+            params["model"] = Value::String(model.to_owned());
+        }
+        if let Some(reasoning_effort) = reasoning_effort {
+            params["config"] = json!({"model_reasoning_effort": reasoning_effort});
+        }
+        let response = self.rpc("thread/start", params).await?;
         let thread = response
             .get("thread")
             .cloned()
@@ -324,6 +501,55 @@ impl CodexAppServerGateway {
         snapshot
             .runtimes
             .insert(thread_id.to_owned(), CodexThreadRuntime { active_turn_id, status });
+    }
+
+    #[cfg(unix)]
+    async fn fallback_descendant_threads(
+        &self,
+        ancestor_thread_id: &str,
+        archived: bool,
+    ) -> Result<Vec<Value>, CodexAppServerError> {
+        let state_db = self.codex_home.join("state_5.sqlite");
+        if !state_db.is_file() {
+            return Ok(Vec::new());
+        }
+        let ancestor_thread_id = ancestor_thread_id.to_owned();
+        let thread_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+            let connection = rusqlite::Connection::open_with_flags(&state_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| error.to_string())?;
+            let mut statement = connection
+                .prepare(
+                    "WITH RECURSIVE descendants(id) AS (\
+                         SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?1 \
+                         UNION \
+                         SELECT edge.child_thread_id \
+                         FROM thread_spawn_edges edge \
+                         JOIN descendants parent ON edge.parent_thread_id = parent.id\
+                     ) \
+                     SELECT descendants.id \
+                     FROM descendants \
+                     JOIN threads ON threads.id = descendants.id \
+                     WHERE threads.archived = ?2 \
+                     ORDER BY COALESCE(threads.updated_at_ms, threads.updated_at * 1000) DESC \
+                     LIMIT 500",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(rusqlite::params![ancestor_thread_id, archived], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| CodexAppServerError::Unavailable(format!("join Codex state catalog read: {error}")))?
+        .map_err(|error| CodexAppServerError::Unavailable(format!("read Codex descendant catalog: {error}")))?;
+        let mut threads = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            if let Ok(thread) = self.read_thread(&thread_id, false).await {
+                threads.push(thread);
+            }
+        }
+        Ok(threads)
     }
 }
 
@@ -576,7 +802,10 @@ async fn connect_socket(path: &Path) -> Result<WebSocketStream<UnixStream>, Code
     let stream = UnixStream::connect(path)
         .await
         .map_err(|error| CodexAppServerError::Unavailable(error.to_string()))?;
-    let (socket, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(128 << 20))
+        .max_frame_size(Some(128 << 20));
+    let (socket, _) = tokio_tungstenite::client_async_with_config("ws://localhost/", stream, Some(config))
         .await
         .map_err(|error| CodexAppServerError::Unavailable(error.to_string()))?;
     Ok(socket)

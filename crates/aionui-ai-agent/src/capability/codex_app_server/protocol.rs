@@ -41,6 +41,24 @@ pub struct CodexSendReceipt {
     pub steered: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CodexThreadItemsPage {
+    pub entries: Vec<Value>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexThreadPage {
+    pub threads: Vec<Value>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexThreadTurnsPage {
+    pub entries: Vec<Value>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CodexAppServerError {
     #[error("Codex app-server is unavailable: {0}")]
@@ -80,17 +98,60 @@ impl CodexAppServerError {
             _ => false,
         }
     }
+
+    pub fn is_thread_items_unsupported(&self) -> bool {
+        matches!(
+            self,
+            Self::Rpc { code: -32601, message, .. }
+                if message.contains("thread/items/list") && message.contains("not supported")
+        )
+    }
 }
 
 #[async_trait]
 pub trait ICodexAppServerGateway: Send + Sync {
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CodexAppServerEvent>;
     async fn snapshot(&self) -> CodexAppServerSnapshot;
-    async fn list_threads(&self, archived: bool) -> Result<Vec<Value>, CodexAppServerError>;
+    async fn list_models(&self) -> Result<Vec<Value>, CodexAppServerError>;
+    async fn list_thread_page(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+        archived: bool,
+    ) -> Result<CodexThreadPage, CodexAppServerError>;
+    async fn list_thread_descendants(
+        &self,
+        ancestor_thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        archived: bool,
+    ) -> Result<CodexThreadPage, CodexAppServerError> {
+        let _ = (ancestor_thread_id, cursor, limit, archived);
+        Err(CodexAppServerError::Unavailable(
+            "Codex descendant catalog is not implemented by this gateway".into(),
+        ))
+    }
     async fn list_loaded_threads(&self) -> Result<Vec<String>, CodexAppServerError>;
     async fn read_thread(&self, thread_id: &str, include_turns: bool) -> Result<Value, CodexAppServerError>;
     async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexAppServerError>;
-    async fn start_thread(&self, cwd: &str) -> Result<Value, CodexAppServerError>;
+    async fn list_thread_items(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<CodexThreadItemsPage, CodexAppServerError>;
+    async fn list_thread_turns_summary(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<CodexThreadTurnsPage, CodexAppServerError>;
+    async fn start_thread(
+        &self,
+        cwd: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Value, CodexAppServerError>;
     async fn send_input(
         &self,
         thread_id: &str,

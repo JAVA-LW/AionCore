@@ -61,6 +61,15 @@ pub trait IConversationRepository: Send + Sync {
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Lists Codex conversations projected directly under a parent task.
+    async fn list_codex_subagents(
+        &self,
+        _user_id: &str,
+        _parent_conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,
@@ -256,6 +265,10 @@ pub struct ConversationFilters {
     pub pinned: Option<bool>,
     /// Filter by the exact `extra.workspace` value.
     pub workspace: Option<String>,
+    /// Exclude conversations projected from Codex sub-agent threads.
+    pub codex_root_only: bool,
+    /// Filter projected Codex sub-agents by their AionUI parent conversation.
+    pub codex_parent_conversation_id: Option<String>,
 }
 
 impl ConversationFilters {

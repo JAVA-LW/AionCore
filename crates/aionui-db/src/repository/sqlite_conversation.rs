@@ -335,6 +335,7 @@ impl IConversationRepository for SqliteConversationRepository {
                AND COALESCE(json_extract(extra, '$.is_health_check'), 0) != 1 \
                AND json_extract(extra, '$.team_id') IS NULL \
                AND json_extract(extra, '$.teamId') IS NULL \
+               AND COALESCE(json_extract(extra, '$.codex_thread_role'), 'root') != 'subagent' \
              GROUP BY json_extract(extra, '$.workspace') \
              ORDER BY latest_conversation_at DESC, workspace ASC",
         )
@@ -343,6 +344,24 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    async fn list_codex_subagents(
+        &self,
+        user_id: &str,
+        parent_conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(sqlx::query_as::<_, ConversationRow>(
+            "SELECT * FROM conversations \
+             WHERE user_id = ? \
+               AND type = 'codex-app-server' \
+               AND json_extract(extra, '$.codex_parent_conversation_id') = ? \
+             ORDER BY updated_at DESC, id DESC",
+        )
+        .bind(user_id)
+        .bind(parent_conversation_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn find_by_source_and_chat(
@@ -1021,6 +1040,13 @@ fn append_filter_conditions(filters: &ConversationFilters, where_parts: &mut Vec
     if let Some(ref workspace) = filters.workspace {
         where_parts.push("json_extract(c.extra, '$.workspace') = ?".to_string());
         binds.push(BindValue::Str(workspace.clone()));
+    }
+    if filters.codex_root_only {
+        where_parts.push("COALESCE(json_extract(c.extra, '$.codex_thread_role'), 'root') != 'subagent'".to_string());
+    }
+    if let Some(ref parent_conversation_id) = filters.codex_parent_conversation_id {
+        where_parts.push("json_extract(c.extra, '$.codex_parent_conversation_id') = ?".to_string());
+        binds.push(BindValue::Str(parent_conversation_id.clone()));
     }
 }
 

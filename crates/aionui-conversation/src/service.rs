@@ -467,6 +467,15 @@ impl ConversationService {
         self.codex_native.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
+    pub async fn list_codex_native_models(&self) -> Result<Vec<serde_json::Value>, ConversationError> {
+        self.codex_native()
+            .ok_or_else(|| ConversationError::Busy {
+                reason: "Codex app-server runtime is unavailable".into(),
+            })?
+            .list_models()
+            .await
+    }
+
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
@@ -1802,15 +1811,47 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(user_id = %user_id))]
     pub async fn list_projects(&self, user_id: &str) -> Result<ConversationProjectListResponse, ConversationError> {
         let rows = self.conversation_repo.list_projects(user_id).await?;
-        Ok(rows
+        let mut projects = rows
             .into_iter()
             .filter(|row| !std::path::Path::new(&row.workspace).starts_with(&self.workspace_root))
-            .map(|row| ConversationProjectResponse {
-                workspace: row.workspace,
-                latest_conversation_at: row.latest_conversation_at,
-                conversation_count: row.conversation_count.max(0) as u64,
+            .map(|row| {
+                (
+                    row.workspace.clone(),
+                    ConversationProjectResponse {
+                        workspace: row.workspace,
+                        latest_conversation_at: row.latest_conversation_at,
+                        conversation_count: row.conversation_count.max(0) as u64,
+                    },
+                )
             })
-            .collect())
+            .collect::<HashMap<_, _>>();
+
+        if let Some(runtime) = self.codex_native() {
+            for workspace in runtime.list_workspaces_for_user(user_id).await? {
+                if std::path::Path::new(&workspace.root_path).starts_with(&self.workspace_root) {
+                    continue;
+                }
+                projects
+                    .entry(workspace.root_path.clone())
+                    .and_modify(|project| {
+                        project.latest_conversation_at = project.latest_conversation_at.max(workspace.updated_at);
+                    })
+                    .or_insert(ConversationProjectResponse {
+                        workspace: workspace.root_path,
+                        latest_conversation_at: workspace.updated_at,
+                        conversation_count: 0,
+                    });
+            }
+        }
+
+        let mut projects = projects.into_values().collect::<Vec<_>>();
+        projects.sort_by(|left, right| {
+            right
+                .latest_conversation_at
+                .cmp(&left.latest_conversation_at)
+                .then_with(|| left.workspace.cmp(&right.workspace))
+        });
+        Ok(projects)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -1827,6 +1868,8 @@ impl ConversationService {
             cron_job_id: query.cron_job_id,
             pinned: query.pinned,
             workspace: query.workspace,
+            codex_root_only: query.codex_root_only.unwrap_or(false),
+            codex_parent_conversation_id: query.codex_parent_conversation_id,
         };
 
         let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
@@ -2280,7 +2323,8 @@ impl ConversationService {
         query: ListMessagesQuery,
     ) -> Result<MessageListResponse, ConversationError> {
         // Verify conversation exists and belongs to user
-        self.conversation_repo
+        let conversation = self
+            .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
@@ -2310,10 +2354,48 @@ impl ConversationService {
         };
         let compact_content = matches!(query.content_mode.as_deref(), Some("compact"));
 
-        let page = self
+        let page_params = MessagePageParams {
+            limit,
+            direction: direction.clone(),
+        };
+        let mut page = self
             .conversation_repo
-            .list_messages_page(conversation_id, &MessagePageParams { limit, direction })
+            .list_messages_page(conversation_id, &page_params)
             .await?;
+
+        let mut codex_source_has_older = false;
+        if parse_agent_type_from_row(&conversation) == Some(AgentType::CodexAppServer)
+            && let Some(runtime) = self.codex_native()
+            && let Some(binding) = runtime.binding_for_conversation(conversation_id).await?
+        {
+            let initial_page_missing = matches!(direction, MessagePageDirection::InitialLatest)
+                && binding.history_next_created_at.is_none()
+                && !binding.history_complete;
+            let local_before_exhausted = matches!(direction, MessagePageDirection::Before { .. })
+                && !page.has_more_before
+                && !binding.history_complete;
+            if initial_page_missing || local_before_exhausted {
+                if let Err(error) = runtime
+                    .sync_history_page(conversation_id, binding.history_cursor.as_deref(), limit)
+                    .await
+                {
+                    warn!(
+                        conversation_id,
+                        error = %ErrorChain(&error),
+                        "Codex source history page synchronization failed"
+                    );
+                } else {
+                    page = self
+                        .conversation_repo
+                        .list_messages_page(conversation_id, &page_params)
+                        .await?;
+                }
+            }
+            codex_source_has_older = runtime
+                .binding_for_conversation(conversation_id)
+                .await?
+                .is_some_and(|binding| !binding.history_complete);
+        }
 
         let mut compacted_count = 0usize;
         let mut total_original_content_bytes = 0usize;
@@ -2369,7 +2451,7 @@ impl ConversationService {
             items,
             oldest_cursor,
             newest_cursor,
-            has_more_before: page.has_more_before,
+            has_more_before: page.has_more_before || codex_source_has_older,
             has_more_after: page.has_more_after,
         })
     }

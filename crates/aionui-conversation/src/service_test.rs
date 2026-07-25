@@ -6252,6 +6252,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
                 cron_job_id: None,
                 pinned: None,
                 workspace: None,
+                ..Default::default()
             },
         )
         .await
@@ -6396,6 +6397,7 @@ async fn existing_conversation_reads_current_assistant_identity() {
                 cron_job_id: None,
                 pinned: None,
                 workspace: None,
+                ..Default::default()
             },
         )
         .await
